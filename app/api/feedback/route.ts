@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
-import { generateObject } from "ai"
+import { callXAI, getApiKey } from "@/lib/xai-client"
 import { z } from "zod"
 
 const feedbackEvaluationSchema = z.object({
@@ -9,6 +9,18 @@ const feedbackEvaluationSchema = z.object({
   shouldReanalyze: z.boolean().describe("Whether the meme should be re-analyzed with this feedback"),
   reasoning: z.string().describe("Brief explanation of the evaluation"),
 })
+
+function extractJSON(text: string): unknown {
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (codeBlockMatch) {
+    return JSON.parse(codeBlockMatch[1].trim())
+  }
+  const jsonMatch = text.match(/\{[\s\S]*\}/)
+  if (jsonMatch) {
+    return JSON.parse(jsonMatch[0])
+  }
+  throw new Error("No JSON found in response")
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -60,23 +72,22 @@ export async function POST(request: NextRequest) {
     let evaluationReasoning = ""
 
     try {
-      console.log("[v0] Evaluating feedback with AI via Vercel AI Gateway...")
+      const apiKey = getApiKey()
+      if (!apiKey) {
+        console.warn("[v0] Grok API key not configured, skipping AI evaluation")
+        shouldReanalyze = feedbackType === "reanalyze"
+      } else {
+        console.log("[v0] Evaluating feedback with Grok API...")
 
-      const feedbackContext = `
+        const feedbackContext = `
 Feedback Type: ${feedbackType}
 User Context: ${userContext}
 ${culturalContext ? `Cultural Context: ${culturalContext}` : ""}
 ${historicalContext ? `Historical Context: ${historicalContext}` : ""}
 ${additionalSources ? `Additional Sources: ${additionalSources}` : ""}
-      `.trim()
+        `.trim()
 
-      const { object: evaluation } = await generateObject({
-        model: "openai/gpt-4o-mini", // Using OpenAI via Vercel AI Gateway
-        schema: feedbackEvaluationSchema,
-        messages: [
-          {
-            role: "user",
-            content: `You are evaluating user feedback on a meme analysis. Determine if this feedback is valid, adds meaningful value, and whether the meme should be re-analyzed with this new context.
+        const prompt = `You are evaluating user feedback on a meme analysis. Determine if this feedback is valid, adds meaningful value, and whether the meme should be re-analyzed with this new context.
 
 Feedback to evaluate:
 ${feedbackContext}
@@ -88,22 +99,35 @@ Consider:
 4. Is it constructive and specific (not just "I disagree")?
 5. Would incorporating this feedback improve the analysis?
 
-Be generous - if the feedback adds ANY meaningful context or perspective, recommend re-analysis.`,
-          },
-        ],
-        maxTokens: 500,
-        temperature: 0.3,
-      })
+Be generous - if the feedback adds ANY meaningful context or perspective, recommend re-analysis.
 
-      shouldReanalyze = evaluation.shouldReanalyze
-      evaluationReasoning = evaluation.reasoning
+IMPORTANT: Respond with ONLY a valid JSON object:
+{
+  "isValid": true or false,
+  "addsValue": true or false,
+  "shouldReanalyze": true or false,
+  "reasoning": "brief explanation"
+}`
 
-      console.log("[v0] AI Evaluation:", {
-        isValid: evaluation.isValid,
-        addsValue: evaluation.addsValue,
-        shouldReanalyze: evaluation.shouldReanalyze,
-        reasoning: evaluation.reasoning,
-      })
+        const responseText = await callXAI([{ role: "user", content: prompt }], {
+          model: "grok-2-latest",
+          maxTokens: 500,
+          temperature: 0.3,
+        })
+
+        const parsed = extractJSON(responseText)
+        const evaluation = feedbackEvaluationSchema.parse(parsed)
+
+        shouldReanalyze = evaluation.shouldReanalyze
+        evaluationReasoning = evaluation.reasoning
+
+        console.log("[v0] AI Evaluation:", {
+          isValid: evaluation.isValid,
+          addsValue: evaluation.addsValue,
+          shouldReanalyze: evaluation.shouldReanalyze,
+          reasoning: evaluation.reasoning,
+        })
+      }
     } catch (evalError) {
       console.error("[v0] Error evaluating feedback:", evalError)
       // If evaluation fails, default to re-analyzing for "reanalyze" type

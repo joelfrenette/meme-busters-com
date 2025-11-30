@@ -1,6 +1,6 @@
 "use server"
 
-import { generateObject } from "ai"
+import { callXAI, createTextContent, createImageContent, type XAIContentPart } from "@/lib/xai-client"
 import { z } from "zod"
 import { createClient } from "@/lib/supabase/server"
 import { revalidatePath } from "next/cache"
@@ -91,6 +91,23 @@ export type AnalysisSuccess = {
 
 export type AnalysisResponse = AnalysisSuccess | AnalysisError
 
+// Helper to extract JSON from response
+function extractJSON(text: string): unknown {
+  // Try to find JSON in code blocks first
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (codeBlockMatch) {
+    return JSON.parse(codeBlockMatch[1].trim())
+  }
+
+  // Try to find raw JSON object
+  const jsonMatch = text.match(/\{[\s\S]*\}/)
+  if (jsonMatch) {
+    return JSON.parse(jsonMatch[0])
+  }
+
+  throw new Error("No JSON found in response")
+}
+
 export async function performAnalysis(
   imageData: string,
   additionalContext?: string,
@@ -107,7 +124,7 @@ export async function performAnalysis(
 
   console.log(`[v0] Image recognized as meme with ${recognition.confidence}% confidence. Proceeding to analysis...`)
 
-  console.log("[v0] Step 2: Starting meme analysis with OpenAI via Vercel AI Gateway...")
+  console.log("[v0] Step 2: Starting meme analysis with Grok API...")
 
   const supabase = await createClient()
   const { data: promptData, error: promptError } = await supabase
@@ -123,121 +140,61 @@ export async function performAnalysis(
 
   const promptText =
     promptData?.prompt_text ||
-    `You are a center-right, unbiased meme analysis and fact-checking expert. Analyze this meme image and categorize it using this taxonomy focused on TRUTHFULNESS and ACCURACY:
+    `You are a center-right, unbiased meme analysis and fact-checking expert. Analyze this meme image and categorize it.`
 
-**Truthfulness & Accuracy Categories:**
-- "factual" - Completely true and verifiable with credible sources
-- "misleading" - True but missing important context or cherry-picked facts that create false impression
-- "out_of_context" - True statement used in wrong context to imply something false
-- "distorted" - Facts twisted, exaggerated, or misrepresented to support a narrative
-- "misinformation" - False information (may not be intentionally deceptive)
-- "lies" - Intentionally false and deceptive claims
-- "unverifiable" - Claims that cannot be fact-checked with available credible sources
+  // Build the prompt with JSON format instructions
+  let fullPrompt = `${promptText}
 
-**Tone-Based Categories:**
-- "sarcasm" - Says the opposite of what's meant to mock or criticize
-- "satire" - Humor that ridicules people, politics, or society
-- "humor" - Straightforward comedy without deeper meaning
-- "wholesome" - Positive, heartwarming, or uplifting
-- "dark_humor" - Funny but morbid, offensive, or tragic
-
-**CRITICAL: Source Selection & Bias Guidelines**
-When fact-checking claims, you MUST:
-
-1. **PRIORITIZE UNBIASED NEWS SOURCES:**
-   - Ground News (https://ground.news/) - Shows multiple perspectives
-   - AllSides (https://www.allsides.com/unbiased-balanced-news) - Balanced coverage
-   - The Free Press (https://www.thefp.com/) - Independent journalism
-   - 1440 Daily Digest (https://join1440.com/) - Unbiased news
-   - We Defend Truth (https://www.wedefendtruth.org/) - Truth-focused
-
-2. **USE FACT-CHECKING SITES:**
-   - Debunk.org (https://www.debunk.org/)
-   - FactCheck.org (https://www.factcheck.org/fake-news/)
-   - Snopes (https://www.snopes.com/)
-   - PolitiFact (https://www.politifact.com/)
-   - Reuters Fact Check
-   - Know Your Meme (https://knowyourmeme.com/)
-   - Washington Post Fact Checker (https://www.washingtonpost.com/politics/fact-checker/)
-   - Retraction Watch (https://retractionwatch.com/)
-
-3. **AVOID MAINSTREAM MEDIA BIAS:**
-   - DO NOT rely primarily on legacy/mainstream media (CNN, MSNBC, NYT, WaPo) as they are known for left-leaning bias and partisan narratives
-   - If using mainstream sources, balance with independent and center-right perspectives
-   - Question narratives that align with Democratic/progressive talking points
-   - Be skeptical of sources that blindly support left-wing agendas
-
-4. **MAINTAIN CENTER-RIGHT PERSPECTIVE:**
-   - Approach fact-checking from a center-unbiased or slightly right-leaning viewpoint
-   - Avoid "woke" or progressive framing
-   - Challenge liberal narratives and Democratic socialist agendas
-   - Recognize media double standards and hypocrisy
-
-5. **SOURCE DIVERSITY:**
-   - When claims are politically charged, include perspectives from independent journalists and alternative media
-   - Prioritize primary sources, official documents, and data over media interpretation
-   - Include right-leaning sources when relevant (Daily Wire, Federalist, National Review)
-
-**IMPORTANT: Sources are OPTIONAL for humor/satire/sarcasm**
-- For factual claims, you MUST provide credible sources
-- For humor, satire, sarcasm, or dark_humor, sources are optional (you can provide an empty sources array)
-- Only provide sources when they add value to the analysis
-
-**FOCUS ON TRUTHFULNESS:**
-Your primary goal is to determine if claims are TRUE or FALSE, not to identify political messaging.
-- A political meme can be "factual" if its claims are true, even if it promotes a party
-- A political meme is "misleading" if it cherry-picks facts or omits context
-- A political meme is "lies" if it makes demonstrably false claims
-- Only use "unverifiable" if you genuinely cannot find credible sources to verify the claim
-
-Be thorough, maintain a center-right perspective, and provide detailed explanations. Use real URLs from credible, unbiased sources when available.`
-
-  const messageContent: any[] = [
+IMPORTANT: You MUST respond with ONLY a valid JSON object (no markdown, no explanation) in this exact format:
+{
+  "overallVerdict": "one of: factual, misleading, out_of_context, distorted, misinformation, lies, unverifiable, sarcasm, satire, humor, wholesome, dark_humor",
+  "confidence": number between 0-100,
+  "claims": [
     {
-      type: "text",
-      text: promptText,
-    },
+      "text": "the specific claim",
+      "verdict": "same options as overallVerdict",
+      "confidence": number between 0-100,
+      "explanation": "brief explanation",
+      "sources": [{"title": "source title", "url": "https://...", "publisher": "publisher name"}] or []
+    }
   ]
+}`
 
-  // Add user feedback context if provided
   if (additionalContext) {
     console.log("[v0] Including additional context from user feedback")
-    messageContent.push({
-      type: "text",
-      text: `\n\n**IMPORTANT: Human Feedback Context**\n\nA human reviewer has provided the following additional context that you should incorporate into your analysis:\n\n${additionalContext}\n\nPlease take this human interpretation into account, especially regarding cultural, historical, or contextual meanings that may not be immediately apparent from the image alone. The human perspective is valuable for understanding nuances that AI might miss.`,
-    })
+    fullPrompt += `
+
+**IMPORTANT: Human Feedback Context**
+A human reviewer has provided the following additional context:
+${additionalContext}
+
+Please take this human interpretation into account.`
   }
 
-  messageContent.push({
-    type: "image",
-    image: imageData,
-  })
+  const content: XAIContentPart[] = [createTextContent(fullPrompt), createImageContent(imageData)]
 
   try {
-    const { object } = await generateObject({
-      model: "openai/gpt-4o",
-      schema: memeAnalysisSchema,
-      messages: [
-        {
-          role: "user",
-          content: messageContent,
-        },
-      ],
+    const responseText = await callXAI([{ role: "user", content }], {
+      model: "grok-2-vision-latest",
       maxTokens: 4000,
       temperature: 0.3,
     })
 
-    console.log("[v0] Analysis complete:", JSON.stringify(object, null, 2))
+    console.log("[v0] Raw response:", responseText.substring(0, 500))
 
-    return object
-  } catch (schemaError) {
-    console.error("[v0] Schema validation error:", schemaError)
-    console.error("[v0] This usually means the AI returned a response that doesn't match the expected format")
+    const parsed = extractJSON(responseText)
+    const validated = memeAnalysisSchema.parse(parsed)
 
-    const error: any = new Error("AI response validation failed")
-    error.details =
+    console.log("[v0] Analysis complete:", JSON.stringify(validated, null, 2))
+
+    return validated
+  } catch (error) {
+    console.error("[v0] Schema validation error:", error)
+
+    const err: any = new Error("AI response validation failed")
+    err.details =
       "The AI model returned a response that doesn't match the expected format. This could be due to:\n• Invalid verdict category\n• Missing required fields\n• Malformed URLs in sources\n• Confidence values outside 0-100 range\n\nPlease try analyzing the meme again."
-    throw error
+    throw err
   }
 }
 
@@ -338,8 +295,7 @@ export async function analyzeMeme(imageData: string, additionalContext?: string)
         success: false,
         category: "api_key_missing",
         message: "AI service is not configured",
-        details:
-          "The XAI_API_KEY or GROK_XAI_API_KEY environment variable is missing. Please contact the administrator.",
+        details: "The XAI_API_KEY or GROK_API_KEY environment variable is missing. Please contact the administrator.",
       }
     }
 
